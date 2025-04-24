@@ -3,4 +3,4 @@
 
 __version__ = '0.1.0'
 
-from hagent.tool.aiprof import AIProf
+from hagent.tool.profiling_agent import ProfilingAgent
