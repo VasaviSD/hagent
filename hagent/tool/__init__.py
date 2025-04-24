@@ -2,3 +2,5 @@
 """hagent tool"""
 
 __version__ = '0.1.0'
+
+from hagent.tool.aiprof import AIProf
