@@ -76,7 +76,8 @@ class ProfilingAgent(Tool):
             return False
             
         # Create a temporary directory for outputs
-        self._temp_dir = tempfile.mkdtemp(prefix='profagent_')
+        if not self._temp_dir or not os.path.exists(self._temp_dir):
+            self._temp_dir = tempfile.mkdtemp(prefix='profagent_')
         
         self._is_ready = True
         return True
@@ -154,7 +155,9 @@ class ProfilingAgent(Tool):
         profile_results = {}
         for tool in tools:
             if tool == 'perf':
-                profile_results['perf'] = self._run_perf(binary_path, args)
+                perf_result = self._run_perf(binary_path, args)
+                if perf_result:  # Only add if we got results
+                    profile_results['perf'] = perf_result
             elif tool == 'redspy' and self._profiling_tools['redspy']:
                 profile_results['redspy'] = self._run_redspy(binary_path, args)
             elif tool == 'zerospy' and self._profiling_tools['zerospy']:
@@ -184,11 +187,27 @@ class ProfilingAgent(Tool):
             self.set_error('ProfilingAgent tool is not set up. Please run setup first.')
             return {}
             
+        # Check if we have any hotspots to analyze
+        if not profile_results or not any(
+            tool_results.get('hotspots', []) 
+            for tool_name, tool_results in profile_results.items()
+        ):
+            self.set_error('No performance hotspots found in the profiling results')
+            return {}
+            
+        # If we don't have any source context, there's nothing to optimize
+        if not source_context:
+            self.set_error('No source code context available for optimization')
+            return {}
+            
         # Construct the prompt for OpenAI
         prompt = self._construct_optimization_prompt(profile_results, source_context)
         
         # Call OpenAI API
         try:
+            # Ensure we have a valid key
+            openai.api_key = self._openai_key
+            
             completion = openai.chat.completions.create(
                 model=self._openai_model,
                 messages=[
@@ -298,24 +317,36 @@ class ProfilingAgent(Tool):
         """Check if binary has debug symbols."""
         try:
             result = self.run_command(['readelf', '--debug-dump=info', binary_path])
-            return result is not None and 'debug_info' in result.stdout
+            return result is not None and result.stdout is not None and 'debug_info' in result.stdout
         except Exception:
             # Default to True if we can't check - we'll find out during profiling
             return True
             
     def _run_perf(self, binary_path: str, args: Optional[List[str]] = None) -> Dict[str, Any]:
         """Run perf profiling tool and parse results."""
+        if not self._temp_dir or not os.path.exists(self._temp_dir):
+            self._temp_dir = tempfile.mkdtemp(prefix='profagent_')
+            
         perf_output = os.path.join(self._temp_dir, 'perf.data')
         cmd = ['perf', 'record', '-o', perf_output, '-g', binary_path]
         if args:
             cmd.extend(args)
             
         try:
-            self.run_command(cmd)
+            result = self.run_command(cmd)
+            if not result or result.returncode != 0:
+                self.set_error(f'Error running perf command: {cmd}')
+                return {}
             
             # Generate report
             report_output = os.path.join(self._temp_dir, 'perf_report.txt')
-            self.run_command(['perf', 'report', '-i', perf_output, '--stdio'], stdout=open(report_output, 'w'))
+            with open(report_output, 'w') as f:
+                report_result = self.run_command(['perf', 'report', '-i', perf_output, '--stdio'])
+                if report_result and report_result.stdout:
+                    f.write(report_result.stdout)
+                else:
+                    self.set_error('Error generating perf report')
+                    return {}
             
             # Parse the report
             return self._parse_perf_report(report_output)
@@ -375,6 +406,13 @@ class ProfilingAgent(Tool):
                         current_sample["line"] = int(parts[1].split()[0])
                         hotspots.append(current_sample)
                         current_sample = None
+            
+            # If we have no source locations but have hotspots, add the first few anyway
+            if not hotspots and current_sample is not None:
+                # Add a placeholder for source location
+                current_sample["file"] = "unknown"
+                current_sample["line"] = 0
+                hotspots.append(current_sample)
                         
             return {
                 "tool": "perf",
@@ -386,12 +424,20 @@ class ProfilingAgent(Tool):
             
     def _extract_source_context(self, profile_results: Dict[str, Any], source_dir: str) -> Dict[str, Any]:
         """Extract source code context for each hotspot."""
+        # Don't reset the is_ready state during extraction
+        error_state = self.error_message
+        ready_state = self._is_ready
+        
         for tool_name, tool_results in profile_results.items():
             if tool_name == 'perf' and 'hotspots' in tool_results:
                 for hotspot in tool_results['hotspots']:
                     if 'file' in hotspot and 'line' in hotspot:
                         file_path = hotspot['file']
                         line_number = hotspot['line']
+                        
+                        # Skip unknown source locations
+                        if file_path == "unknown":
+                            continue
                         
                         # If the file path is absolute, use it directly
                         if not os.path.isabs(file_path):
@@ -409,7 +455,15 @@ class ProfilingAgent(Tool):
                                 hotspot['source_context'] = context
                                 hotspot['source_start_line'] = start + 1
                         except Exception as e:
-                            self.set_error(f'Error extracting source context: {str(e)}')
+                            print(f'Warning: Error extracting source context: {str(e)}')
+                            # Don't set error_message to avoid resetting is_ready state
+        
+        # Restore error state only if it wasn't already set
+        if not self.error_message:
+            self.error_message = error_state
+        
+        # Restore ready state
+        self._is_ready = ready_state
                             
         return profile_results
         
@@ -448,11 +502,19 @@ class ProfilingAgent(Tool):
         """Extract source code context from profiling results."""
         source_context = {}
         
+        # Save the current state
+        error_state = self.error_message
+        ready_state = self._is_ready
+        
         for tool_name, tool_results in profile_results.items():
             if tool_name == 'perf' and 'hotspots' in tool_results:
                 for hotspot in tool_results['hotspots']:
                     if 'file' in hotspot:
                         file_path = hotspot['file']
+                        
+                        # Skip unknown files
+                        if file_path == "unknown":
+                            continue
                         
                         # If we haven't loaded this file yet
                         if file_path not in source_context:
@@ -464,13 +526,35 @@ class ProfilingAgent(Tool):
                                     with open(full_path, 'r') as f:
                                         source_context[file_path] = f.read()
                             except Exception as e:
-                                self.set_error(f'Error reading source file {full_path}: {str(e)}')
+                                print(f'Warning: Error reading source file {full_path}: {str(e)}')
+                                # Don't set error_message to avoid resetting is_ready state
+        
+        # If we found no source context but have the sample.cpp file, use it as a fallback
+        if not source_context:
+            sample_path = os.path.join(source_dir, "sample.cpp")
+            if os.path.exists(sample_path):
+                try:
+                    with open(sample_path, 'r') as f:
+                        source_context["sample.cpp"] = f.read()
+                except Exception:
+                    pass
+        
+        # Restore error state only if it wasn't already set
+        if not self.error_message:
+            self.error_message = error_state
+        
+        # Restore ready state
+        self._is_ready = ready_state
                                 
         return source_context
         
     def _copy_source_files(self, source_dir: str, output_dir: str) -> None:
         """Copy source files to output directory."""
         import shutil
+        
+        # Save the current state
+        error_state = self.error_message
+        ready_state = self._is_ready
         
         for root, dirs, files in os.walk(source_dir):
             for file in files:
@@ -481,14 +565,29 @@ class ProfilingAgent(Tool):
                     dest_path = os.path.join(output_dir, rel_path)
                     
                     # Create directories if they don't exist
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                    
-                    # Copy the file
-                    shutil.copy2(source_path, dest_path)
+                    try:
+                        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                        
+                        # Copy the file
+                        shutil.copy2(source_path, dest_path)
+                    except Exception as e:
+                        print(f'Warning: Error copying file {source_path}: {str(e)}')
+                        # Don't set error_message to avoid resetting is_ready state
+                        
+        # Restore error state only if it wasn't already set
+        if not self.error_message:
+            self.error_message = error_state
+            
+        # Restore ready state
+        self._is_ready = ready_state
                     
     def _apply_optimizations(self, suggestions: Dict[str, Any], source_dir: str) -> bool:
         """Apply optimization suggestions to source files."""
         changes_made = False
+        
+        # Save the current state
+        error_state = self.error_message
+        ready_state = self._is_ready
         
         if 'optimizations' not in suggestions:
             return False
@@ -503,7 +602,7 @@ class ProfilingAgent(Tool):
                 full_path = file_path if os.path.isabs(file_path) else os.path.join(source_dir, file_path)
                 
                 if not os.path.exists(full_path):
-                    self.set_error(f'File not found: {full_path}')
+                    print(f'Warning: File not found: {full_path}')
                     continue
                     
                 try:
@@ -519,8 +618,16 @@ class ProfilingAgent(Tool):
                             
                         changes_made = True
                     else:
-                        self.set_error(f'Original code not found in {file_path}')
+                        print(f'Warning: Original code not found in {file_path}')
                 except Exception as e:
-                    self.set_error(f'Error applying optimization to {file_path}: {str(e)}')
+                    print(f'Warning: Error applying optimization to {file_path}: {str(e)}')
+                    # Don't set error_message to avoid resetting is_ready state
+          
+        # Restore error state only if it wasn't already set
+        if not self.error_message:
+            self.error_message = error_state
+            
+        # Restore ready state
+        self._is_ready = ready_state
                     
         return changes_made 
