@@ -1,78 +1,130 @@
-#!/usr/bin/env python3
-import os
-import tempfile
+# hagent/step/v2chisel_fix/tests/test_v2chisel_fix.py
 import pytest
-from unittest.mock import patch, MagicMock
+from hagent.step.v2chisel_fix.v2chisel_fix import V2chisel_fix, diff_code
 
-from hagent.step.v2chisel_fix.v2chisel_fix import V2chisel_fix
+class DummyFix(V2chisel_fix):
+    def setup(self):
+        # minimal init so run() won’t crash
+        self.base_metadata_context   = 5
+        self.meta                    = 5
+        self.input_data              = {'metadata_context': 5}
+        self.input_file = self.output_file = "<dummy>"
+        self.verilog_fixed_str       = ""
+        self.verilog_original_str    = ""
+        self.verilog_diff_str        = ""
+        self.setup_called            = True
 
 @pytest.fixture
-def valid_input():
-    # Create a minimal valid input dictionary for V2chisel_fix.
+def base_data():
     return {
-        "chisel_pass1": {
-            "chisel_changed": "class MyModule extends Module { val io = IO(new Bundle {}) }",
-            "chisel_subset": "class MyModule extends Module { val io = IO(new Bundle {}) }",
-            "verilog_candidate": "module mymodule(); endmodule",
-            "was_valid": True
+        'chisel_pass1': {
+            'chisel_changed': 'orig_chisel',
+            'verilog_candidate': 'cand_verilog',
+            'was_valid': False,
         },
-        # Provide a nonempty chisel_original so that refined code is not empty.
-        "chisel_original": "class MyModule extends Module { val io = IO(new Bundle {}) }",
-        "verilog_fixed": "module mymodule(); endmodule",
-        "llm": {"model": "test-model"}
+        'verilog_original': '',
+        'verilog_fixed': '',
+        'chisel_original': 'orig_chisel',
     }
 
-@pytest.fixture
-def step_instance(valid_input):
-    step = V2chisel_fix()
-    # Set a dummy output file so that write_output does not fail.
-    step.set_io(inp_file="dummy_input.yaml", out_file="dummy_output.yaml")
-    # Inject the input_data dictionary.
-    step.input_data = valid_input
-    return step
+def test_skip_when_lec_flag_set(base_data):
+    step = DummyFix()
+    step.setup()
+    data = {**base_data, 'lec': 1}
+    result = step.run(data)
+    assert result['lec'] == 1
+    cf = result['chisel_fixed']
+    assert cf['equiv_passed'] is True
+    assert cf['refined_chisel'] == base_data['chisel_original']
+    assert cf['chisel_diff'] == ""
 
-def test_run_initial_equiv_pass(step_instance):
-    """
-    Test when the initial equivalence check passes so no refinement is needed.
-    """
-    # Patch _check_equivalence to always return that the candidate is equivalent.
-    with patch.object(step_instance, "_check_equivalence", return_value=(True, None)):
-        result = step_instance.run(step_instance.input_data)
-        assert result["chisel_fixed"]["equiv_passed"] is True
-        # Expect that the refined chisel equals the original chisel (or chisel_changed)
-        refined = result["chisel_fixed"]["refined_chisel"]
-        assert "class MyModule" in refined
+def test_warn_no_fixed_and_enter_react_failure(monkeypatch, base_data):
+    step = DummyFix()
+    step.setup()
+    data = {**base_data, 'lec': 0}
+    monkeypatch.setattr(step, '_refine_chisel_code', lambda *a, **k: "")
+    monkeypatch.setattr(step, '_refine_chisel_code_with_prompt4', lambda *a, **k: "")
+    class FakeReact:
+        def setup(self, *args, **kwargs): return True
+        def react_cycle(self, *args):            return None
+    monkeypatch.setattr(
+        'hagent.step.v2chisel_fix.v2chisel_fix.React',
+        FakeReact
+    )
+    result = step.run(data)
+    assert result['lec'] == 0
+    cf = result['chisel_fixed']
+    assert cf['equiv_passed'] is False
+    assert cf['refined_chisel'] == base_data['chisel_original']
+    assert cf['chisel_diff'] == ""
 
-def test_run_with_react_refinement(step_instance):
-    """
-    Test when the equivalence check fails so the React cycle is used
-    and it returns a refined candidate.
-    """
-    # Fake equivalence check: always fail.
-    def fake_check_equivalence(gold, candidate):
-        return (False, "Simulated LEC failure")
-    # Fake chisel-to-verilog conversion: always succeed.
-    def fake_run_chisel2v(code):
-        return (True, "dummy verilog", "")
-    with patch.object(step_instance, "_check_equivalence", side_effect=fake_check_equivalence), \
-         patch.object(step_instance, "_run_chisel2v", side_effect=fake_run_chisel2v), \
-         patch("hagent.tool.react.React") as MockReact:
-        mock_react = MagicMock()
-        mock_react.react_cycle.return_value = "refined MyModule code"
-        MockReact.return_value = mock_react
-        result = step_instance.run(step_instance.input_data)
-        assert result["chisel_fixed"]["equiv_passed"] is True
-        assert result["chisel_fixed"]["refined_chisel"] == "refined MyModule code"
+def test_phase1_succeeds_on_first_attempt(monkeypatch, base_data):
+    step = DummyFix()
+    step.setup()
+    data = {**base_data, 'lec': 0, 'verilog_fixed': 'fixed'}
+    step._ce_calls = 0
+    def fake_ce(gold, cand):
+        if step._ce_calls == 0:
+            step._ce_calls += 1
+            return (False, 'err')
+        return (True, None)
+    monkeypatch.setattr(step, '_check_equivalence', fake_ce)
+    monkeypatch.setattr(step, '_refine_chisel_code', lambda *a, **k: "***DIFF***")
+    monkeypatch.setattr(step, '_apply_diff',       lambda o,d: "new_chisel_code")
+    monkeypatch.setattr(step, '_run_chisel2v',     lambda code: (True, "verilog_out", ""))
+    result = step.run(data)
 
-def test_run_react_failure(step_instance):
-    """
-    Test that if React returns an empty string (i.e. refinement fails),
-    the run() method raises an error.
-    """
-    with patch("hagent.tool.react.React") as MockReact:
-        mock_react = MagicMock()
-        # Simulate React cycle failure by returning an empty string.
-        mock_react.react_cycle.return_value = ""
-        MockReact.return_value = mock_react
-        with pytest.raises(Exception, match="React failed to refine the code."):
-            step_instance.run(step_instance.input_data)
+    assert result['lec'] == 1
+    cf = result['chisel_fixed']
+    assert cf['equiv_passed'] is True
+    assert cf['chisel_diff'] == "***DIFF***"
+    assert cf['refined_chisel'] == "new_chisel_code"
+    assert cf['metadata_context'] == step.base_metadata_context
+
+def test_phase1_second_attempt(monkeypatch, base_data):
+    step = DummyFix()
+    step.setup()
+    data = {**base_data, 'lec': 0, 'verilog_fixed': 'fixed'}
+    step._ce_calls = 0
+    def fake_ce(gold, cand):
+        if step._ce_calls == 0:
+            step._ce_calls += 1
+            return (False, 'err')
+        return (True, None)
+    monkeypatch.setattr(step, '_check_equivalence', fake_ce)
+    monkeypatch.setattr(step, '_refine_chisel_code',
+                        lambda orig, err, att: "" if att == 1 else "++INS++")
+    monkeypatch.setattr(step, '_apply_diff',   lambda o,d: "new2")
+    monkeypatch.setattr(step, '_run_chisel2v', lambda c: (True, "v", ""))
+    result = step.run(data)
+
+    assert result['lec'] == 1
+    assert result['chisel_fixed']['chisel_diff'] == "++INS++"
+
+def test_phase2_succeeds(monkeypatch, base_data):
+    step = DummyFix()
+    step.setup()
+    data = {**base_data, 'lec': 0, 'verilog_fixed': 'fixed'}
+    step._ce_calls = 0
+    def fake_ce(gold, cand):
+        if step._ce_calls == 0:
+            step._ce_calls += 1
+            return (False, 'err')
+        return (True, None)
+    monkeypatch.setattr(step, '_check_equivalence', fake_ce)
+    monkeypatch.setattr(step, '_refine_chisel_code',              lambda *a, **k: "")
+    monkeypatch.setattr(step, '_refine_chisel_code_with_prompt4', lambda *a, **k: "--ADD--")
+    monkeypatch.setattr(step, '_apply_diff',                      lambda o,d: "ch2")
+    monkeypatch.setattr(step, '_run_chisel2v',                    lambda c: (True, "v2", ""))
+    result = step.run(data)
+
+    assert result['lec'] == 1
+    cf = result['chisel_fixed']
+    assert cf['chisel_diff'] == "--ADD--"
+    assert cf['refined_chisel'] == "ch2"
+
+def test_diff_code_roundtrip(tmp_path):
+    t1 = "line1\nfoo\n"
+    t2 = "line1\nbar\n"
+    out = diff_code(t1, t2)
+    assert "-foo" in out and "+bar" in out

@@ -15,11 +15,16 @@ from hagent.core.llm_wrap import LLM_wrap
 
 from hagent.tool.chisel2v import Chisel2v
 from hagent.tool.code_scope import Code_scope
-from hagent.tool.chisel_diff_applier import ChiselDiffApplier
+from hagent.step.apply_diff.apply_diff import Apply_diff
 
 from hagent.tool.extract_verilog_diff_keywords import Extract_verilog_diff_keywords
 from hagent.tool.fuzzy_grep import Fuzzy_grep
 from hagent.tool.extract_code import Extract_code_verilog, Extract_code_chisel
+from hagent.tool.metadata_mapper import MetadataMapper
+from hagent.step.extract_hints.extract_hints import Extract_hints
+from hagent.step.generate_diff.generate_diff import Generate_diff
+from hagent.step.verify_candidate.verify_candidate import Verify_candidate
+from hagent.step.unified_diff.unified_diff import Unified_diff
 
 
 def union_hints(hints1: str, hints2: str) -> str:
@@ -68,6 +73,11 @@ class V2Chisel_pass1(Step):
         self.verilog_extractor = Extract_code_verilog()
         self.chisel_extractor = Extract_code_chisel()
 
+        self.metadata_mapper = MetadataMapper(
+            self.input_data.get('verilog_original', ''),
+            self.input_data.get('verilog_fixed', '')
+        )
+
         # Load the single prompt configuration file.
         conf_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'v2chisel_pass1_conf.yaml')
         if not os.path.exists(conf_file):
@@ -84,15 +94,55 @@ class V2Chisel_pass1(Step):
             raise ValueError(self.lw.last_error)
         self.setup_called = True
 
-    def _generate_diff(self, old_code: str, new_code: str) -> str:
-        old_lines = old_code.splitlines()
-        new_lines = new_code.splitlines()
-        diff_lines = difflib.unified_diff(
-            old_lines, new_lines, fromfile='verilog_original.v', tofile='verilog_fixed.v', lineterm='', n=20
-        )
-        return '\n'.join(diff_lines)
+    # def _generate_diff(self, old_code: str, new_code: str) -> str:
+    #     old_lines = old_code.splitlines()
+    #     new_lines = new_code.splitlines()
+    #     diff_lines = difflib.unified_diff(
+    #         old_lines, new_lines, fromfile='verilog_original.v', tofile='verilog_fixed.v', lineterm='', n=20
+    #     )
+    #     return '\n'.join(diff_lines)
+
+    def _is_snippet_empty(self, snippet: str) -> bool:
+        """
+        Returns True if no meaningful code line is marked in the snippet.
+        """
+        for line in snippet.splitlines():
+            if line.startswith('->') and line.split(':', 1)[1].strip():
+                return False
+        return True
 
     def _extract_chisel_subset(self, chisel_code: str, verilog_diff: str, threshold_override: int = None) -> str:
+
+        # --- Metadata-driven hints with extended context ---
+        metadata_pointers = self.metadata_mapper.pointers_for_diff(verilog_diff)
+        print('------------------------------------------------')
+        print('Metadata pointers found:')
+        print(metadata_pointers)
+        print('------------------------------------------------')
+        # Only use metadata if not forcing fuzzy and pointers exist
+        if not getattr(self, 'force_fuzzy', False) and metadata_pointers:
+            # extend context (lines before/after) via config or default to 10
+            metadata_context = self.input_data.get('metadata_context', 10)
+            snippet = self.metadata_mapper.slice_chisel_by_pointers(
+            chisel_code, metadata_pointers, before=5, after=metadata_context
+            )
+
+            # fallback if snippet is effectively empty
+            if self._is_snippet_empty(snippet):
+                print('Metadata-driven snippet empty, falling back to fuzzy-grep')
+            else:
+                print('------------------------------------------------')
+                print('Chisel metadata-driven hints:')
+                print(snippet)
+                print('------------------------------------------------')
+                return snippet
+        # If forcing fuzzy, skip metadata hints
+        if getattr(self, 'force_fuzzy', False):
+            print('------------------------------------------------')
+            print('Force fuzzy-grep enabled: skipping metadata-driven hints')
+            print('------------------------------------------------')
+
+
         # --- Fuzzy_grep part ---
         keywords = Extract_verilog_diff_keywords.get_user_variables(verilog_diff)
         print('------------------------------------------------')
@@ -111,7 +161,7 @@ class V2Chisel_pass1(Step):
 
         chisel_hints = ''
         if 'text' in search_results:
-            
+
             hint_list = [pair[0] for pair in search_results['text']]
             cs = Code_scope(chisel_code)
             scopes = cs.find_nearest_upper_scopes(hint_list)
@@ -135,57 +185,63 @@ class V2Chisel_pass1(Step):
         fixed = code.replace('\\n', '\n').replace('\\t', '\t')
         return fixed
 
-    def _run_chisel2v(self, chisel_code: str):
-        if not chisel_code.strip():
-            return (False, None, 'Chisel snippet is empty')
-        c2v = Chisel2v()
-        success = c2v.setup()
-        if not success:
-            return (False, None, 'chisel2v setup failed: ' + c2v.error_message)
-        # module_name = self._find_chisel_classname(chisel_code)
-        module_name = 'Top'
-        if not module_name:
-            module_name = 'MyModule'
-        try:
-            verilog_out = c2v.generate_verilog(chisel_code, module_name)
-            if 'module' not in verilog_out:
-                return (False, None, "Generated Verilog missing 'module' keyword.")
-            return (True, verilog_out, '')
-        except Exception as e:
-            if "error during sbt launcher" in str(e):
-                print("sbt run does not seem to work")
-                print(str(e))
-                sys.exit(3)
-            return (False, None, str(e))
-
-    def _find_chisel_classname(self, chisel_code: str) -> str:
-        # First, try to find an object named Top that extends App.
-        m = re.search(r'\bobject\s+(Top)\s+extends\s+App\b', chisel_code)
-        if m:
-            return m.group(1)
-        # Next, try to find a class named Top that extends Module.
-        m = re.search(r'\bclass\s+(Top)\s+extends\s+Module\b', chisel_code)
-        if m:
-            return m.group(1)
-        # Fallback: return the first class extending Module.
-        m = re.search(r'\bclass\s+([A-Za-z0-9_]+)\s+extends\s+Module\b', chisel_code)
-        return m.group(1) if m else ''
+    
 
     def run(self, data):
         verilog_original = data.get('verilog_original', '')
         verilog_fixed = data.get('verilog_fixed', '')
         chisel_original = data.get('chisel_original', '')
 
-        verilog_diff_text = self._generate_diff(verilog_original, verilog_fixed)
+        # verilog_diff_text = self._generate_diff(verilog_original, verilog_fixed)
+        # --- GENERATE UNIFIED DIFF VIA our new step ---
+        # use the new UnifiedDiff step instead of the old helper
+        diff_step = Unified_diff()
+        diff_step.set_io(self.input_file, self.output_file)
+        diff_step.input_data = {
+            'verilog_original': verilog_original,
+            'verilog_fixed':    verilog_fixed,
+        }
+        diff_step.setup()
+        data = diff_step.run(data)
+        verilog_diff_text = data['verilog_diff']
         print('************************** Generated Verilog Diff **************************')
         print(verilog_diff_text)
         print('********************************************************')
 
-        # default_threshold = self.input_data.get("threshold", 40)
+        # --- EXTRACT HINTS STEP ---
         default_threshold = self.template_config.template_dict.get('v2chisel_pass1', {}).get('threshold', 80)
-        chisel_subset = self._extract_chisel_subset(chisel_original, verilog_diff_text)
+        # seed the step’s inputs
+        data['verilog_diff']    = verilog_diff_text
+        data['chisel_original'] = chisel_original
+        hints_step = Extract_hints()
+        # give it the same I/O context so setup() won’t complain
+        hints_step.set_io(self.input_file, self.output_file)
+        hints_step.input_data = data
+        hints_step.setup()
+        print("  -- running Extract_hints")
+        data = hints_step.run(data)
+        # immediately echo the hints we just extracted
+        raw_hints = data.get('hints', '').strip()
+        print("\n>>> Extract_hints snippet:")
+        print(raw_hints if raw_hints else "<no hints>")
+        print(">>> end snippet\n")
+        chisel_subset = data.get('hints', '')
         if not chisel_subset.strip():
             self.error('No hint lines extracted from the Chisel code. Aborting LLM call.')
+
+        # === GENERATE DIFF STEP ===
+        print(">>> STEP 2: LLM-based Generate_diff")
+        diff_step = Generate_diff()
+        diff_step.set_io(self.input_file, self.output_file)
+        diff_step.template_config = self.template_config
+        diff_step.lw = self.lw
+        diff_step.setup()
+        diff_step.input_data = data
+        data = diff_step.run(data)
+        print("     ---- Generated DIFF ----")
+        generated_diff = data.get('generated_diff', '')
+        if not generated_diff:
+            self.error('LLM did not produce any diff (generated_diff is empty).')
 
         was_valid = False
         chisel_updated_final = None
@@ -278,14 +334,30 @@ class V2Chisel_pass1(Step):
             print('==============================================')
 
             generated_diff = self._strip_markdown_fences(response_list[0])
-            applier = ChiselDiffApplier()
-            chisel_updated = applier.apply_diff(generated_diff, chisel_original)
+            apply_step = Apply_diff()
+            # propagate the new diff into data for Apply_diff
+            data['generated_diff']  = generated_diff
+            data['chisel_original'] = chisel_original
+            # give Apply_diff the same I/O so setup() won't complain
+            apply_step.set_io(self.input_file, self.output_file)
+            apply_step.input_data = data
+            apply_step.setup()
+            data = apply_step.run(data)
+            chisel_updated = data.get('chisel_candidate', '')
 
             # print("===== FINAL CHISEL CODE AFTER DIFF APPLIER (attempt {}) =====".format(attempt))
             # print(chisel_updated)
             print('Applied the diff.')
 
-            is_valid, verilog_candidate, error_msg = self._run_chisel2v(chisel_updated)
+            # delegate compilation & basic validity check to our new Verify_candidate step
+            verify = Verify_candidate()
+            verify.set_io(self.input_file, self.output_file)
+            verify.input_data = {'chisel_candidate': chisel_updated}
+            verify.setup()
+            verify_result = verify.run({'chisel_candidate': chisel_updated})
+            is_valid       = verify_result.get('was_valid', False)
+            verilog_candidate = verify_result.get('verilog_candidate', None)
+            error_msg      = verify_result.get('error_msg', '')
             if is_valid:
                 prompt_success[prompt_index] = 1
                 chisel_updated_final = chisel_updated
@@ -330,6 +402,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser()
     # The -o flag is required for the output file
     parser.add_argument('-o', required=True, help='Output YAML file')
+    parser.add_argument('-fz', '--force-fuzzy', action='store_true', dest='force_fuzzy', help='Force fuzzy-grep hints first')
     # Add a positional argument for the input file
     parser.add_argument('input_file', help='Input YAML file')
     return parser.parse_args()
@@ -339,6 +412,8 @@ if __name__ == '__main__':  # pragma: no cover
     args = parse_arguments()
     step = V2Chisel_pass1()
     step.parse_arguments()
+    # propagate force-fuzzy flag to the step
+    step.force_fuzzy = args.force_fuzzy
     step.setup()
     result = step.step()  # this returns your result dictionary
 
